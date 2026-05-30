@@ -1,0 +1,1736 @@
+---
+title: "Mouse heart RNA-seq - ROO and ROO+omega3 diet analysis"
+author: "del-Rio-Vazquez, Jose L."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+# Global chunk options: suppress messages and warnings for a cleaner HTML report.
+# All figures are centred at 300 dpi. A fixed random seed guarantees that
+# stochastic steps (ggrepel label placement, fgsea permutations) are
+# reproducible across runs.
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 5.5,
+  dpi = 300
+)
+set.seed(42)
+```
+
+# Scope
+
+This R Markdown analysis is adapted to **mouse heart RNA-seq** data from dietary intervention groups.
+
+Included samples:
+
+- `Control`: samples 9, 11 and 12.
+- `ROO`: samples 5, 6, 7 and 8.
+- `ROO_omega3`: samples 17, 18, 19 and 20.
+
+The analysis intentionally excludes all other samples in the original count matrix. The expected input is a raw gene count matrix with a first column named `gene_id` or `Geneid`, and sample columns named as in the uploaded matrix, e.g. `sample_05`, `sample_06`, etc.
+
+The workflow generates QC plots, PCA, DESeq2 differential expression tables, volcano plots, MA plots, contrast-level DEG heatmaps, contrast-level targeted cardiac-process heatmaps, gene-level boxplots, GSEA/FGSEA enrichments, contrast-level NES heatmaps and chord plots linking enriched pathways to leading-edge genes. In every heatmap, columns represent contrasts rather than individual samples. In chord plots, red indicates upregulation in the numerator of the contrast and blue indicates downregulation.
+
+# Parameters
+
+```{r params}
+# --------------------------------------------------------------------------
+# INPUT / OUTPUT PATHS
+# The script looks for the count matrix in three locations in order:
+#   1. Working directory
+#   2. input_data/ subfolder
+#   3. ../input_data/ (one level up)
+# All outputs are written under OUT_DIR, organised into six subdirectories.
+# --------------------------------------------------------------------------
+COUNT_FILE <- "gene_count_matrix.csv"
+if (!file.exists(COUNT_FILE)) COUNT_FILE <- file.path("input_data", "gene_count_matrix.csv")
+if (!file.exists(COUNT_FILE)) COUNT_FILE <- file.path("..", "input_data", "gene_count_matrix.csv")
+
+OUT_DIR <- "results_mouse_heart_diet"
+DIRS <- list(
+  qc = file.path(OUT_DIR, "01_qc"),
+  de = file.path(OUT_DIR, "02_differential_expression"),
+  enrichment = file.path(OUT_DIR, "03_enrichment"),
+  targeted = file.path(OUT_DIR, "04_targeted_gene_sets"),
+  boxplots = file.path(OUT_DIR, "05_gene_boxplots"),
+  tables = file.path(OUT_DIR, "06_tables")
+)
+invisible(lapply(c(OUT_DIR, unlist(DIRS)), dir.create, recursive = TRUE, showWarnings = FALSE))
+
+# --------------------------------------------------------------------------
+# ANALYSIS THRESHOLDS
+# MIN_COUNT / MIN_SAMPLES: a gene is retained if it has >= MIN_COUNT raw
+#   reads in at least MIN_SAMPLES samples (low-expression filter).
+# PADJ_CUTOFF / LFC_CUTOFF: Benjamini–Hochberg FDR and |log2FC| thresholds
+#   used to call differentially expressed genes (DEGs).
+# TOP_* constants control how many genes / terms are shown in each plot.
+# --------------------------------------------------------------------------
+MIN_COUNT <- 10
+MIN_SAMPLES <- 3
+PADJ_CUTOFF <- 0.05
+LFC_CUTOFF <- 1
+TOP_LABEL_GENES <- 12
+TOP_HEATMAP_GENES <- 50
+TOP_ENRICHMENT_TERMS <- 20
+TOP_ENRICHMENT_HEATMAP_TERMS <- 40
+```
+
+# Packages and helper functions
+
+```{r packages}
+# --------------------------------------------------------------------------
+# REQUIRED PACKAGES
+# Bioconductor: DESeq2, SummarizedExperiment, AnnotationDbi, org.Mm.eg.db,
+#               msigdbr, fgsea, ComplexHeatmap
+# CRAN: tidyverse stack, ggplot2/ggrepel/patchwork, pheatmap, circlize,
+#       RColorBrewer, scales, kableExtra
+# The script stops with a clear error message if any package is missing.
+# --------------------------------------------------------------------------
+required_packages <- c(
+  "DESeq2", "SummarizedExperiment", "AnnotationDbi", "org.Mm.eg.db",
+  "dplyr", "tibble", "readr", "stringr", "tidyr", "purrr", "forcats",
+  "ggplot2", "ggrepel", "scales", "RColorBrewer", "patchwork",
+  "pheatmap", "ComplexHeatmap", "circlize", "grid", "kableExtra",
+  "msigdbr", "fgsea"
+)
+
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing required packages: ", paste(missing_packages, collapse = ", "),
+    "\nInstall CRAN packages with install.packages() and Bioconductor packages with BiocManager::install()."
+  )
+}
+suppressPackageStartupMessages(lapply(required_packages, library, character.only = TRUE))
+
+# Explicit namespace binding to avoid conflicts between dplyr and other packages
+# (e.g. MASS::select, stats::filter) that are silently loaded as dependencies.
+select <- dplyr::select
+filter <- dplyr::filter
+mutate <- dplyr::mutate
+arrange <- dplyr::arrange
+
+# --------------------------------------------------------------------------
+# HELPER FUNCTIONS
+# heart_theme(): custom ggplot2 theme applied to all figures in this report.
+# safe_name():  converts a contrast label into a filesystem-safe string
+#               (replaces +, ω and non-alphanumeric characters with "_").
+# save_plot():  saves a ggplot object as both SVG (vector) and PNG (raster).
+# make_kable(): renders a data frame as a styled HTML table in the report.
+# clean_pathway_name(): strips MSigDB prefixes and formats pathway names
+#               for display in plots and heatmaps.
+# --------------------------------------------------------------------------
+heart_theme <- function(base_size = 12) {
+  theme_classic(base_size = base_size) +
+    theme(
+      axis.text = element_text(color = "black"),
+      plot.title = element_text(face = "bold", hjust = 0),
+      plot.subtitle = element_text(color = "grey35", size = rel(0.9)),
+      legend.title = element_text(face = "bold"),
+      panel.grid.major = element_line(linewidth = 0.2, color = "grey92")
+    )
+}
+
+safe_name <- function(x) {
+  x |>
+    stringr::str_replace_all("\\+", "plus") |>
+    stringr::str_replace_all("ω", "omega") |>
+    stringr::str_replace_all("[^A-Za-z0-9_]+", "_") |>
+    stringr::str_replace_all("_+", "_") |>
+    stringr::str_replace_all("_$", "")
+}
+
+save_plot <- function(plot, filename, width = 8, height = 5.5, dir = DIRS$de) {
+  fn_svg <- file.path(dir, paste0(filename, ".svg"))
+  fn_png <- file.path(dir, paste0(filename, ".png"))
+  ggplot2::ggsave(fn_svg, plot = plot, width = width, height = height, dpi = 300)
+  ggplot2::ggsave(fn_png, plot = plot, width = width, height = height, dpi = 300)
+  invisible(c(fn_svg, fn_png))
+}
+
+make_kable <- function(x, caption, digits = 3) {
+  kableExtra::kbl(x, caption = caption, digits = digits, row.names = FALSE) |>
+    kableExtra::kable_styling(
+      bootstrap_options = c("striped", "hover", "condensed"),
+      full_width = FALSE
+    )
+}
+
+clean_pathway_name <- function(x) {
+  x |>
+    stringr::str_remove("^HALLMARK_") |>
+    stringr::str_remove("^GOBP_") |>
+    stringr::str_remove("^GOCC_") |>
+    stringr::str_remove("^GOMF_") |>
+    stringr::str_remove("^KEGG_") |>
+    stringr::str_replace_all("_", " ") |>
+    stringr::str_to_sentence()
+}
+```
+
+# Metadata
+
+```{r metadata}
+# --------------------------------------------------------------------------
+# SAMPLE SELECTION
+# Only the 11 samples from the three dietary groups are used. All other
+# samples present in the count matrix are silently ignored.
+# condition_code uses underscores (required by DESeq2 formula syntax);
+# condition_label uses the human-readable "ROO+omega3" form for plots.
+# --------------------------------------------------------------------------
+selected_samples <- c(
+  "sample_09", "sample_11", "sample_12",
+  "sample_05", "sample_06", "sample_07", "sample_08",
+  "sample_17", "sample_18", "sample_19", "sample_20"
+)
+
+sample_meta <- tibble::tibble(
+  sample = selected_samples,
+  mouse_id = c("9", "11", "12", "5", "6", "7", "8", "17", "18", "19", "20"),
+  condition_code = factor(
+    c(rep("Control", 3), rep("ROO", 4), rep("ROO_omega3", 4)),
+    levels = c("Control", "ROO", "ROO_omega3")
+  ),
+  condition_label = factor(
+    c(rep("Control", 3), rep("ROO", 4), rep("ROO+omega3", 4)),
+    levels = c("Control", "ROO", "ROO+omega3")
+  ),
+  replicate = c(1:3, 1:4, 1:4)
+)
+sample_meta <- as.data.frame(sample_meta)
+rownames(sample_meta) <- sample_meta$sample
+
+# Consistent colour palette used in all QC and expression plots
+cond_colors <- c(
+  Control = "#4D4D4D",
+  ROO = "#1B7837",
+  `ROO+omega3` = "#762A83"
+)
+
+# --------------------------------------------------------------------------
+# CONTRAST DEFINITIONS
+# Three pairwise contrasts are evaluated. The numerator/denominator convention
+# follows DESeq2: log2FC = log2(numerator / denominator).
+# All downstream heatmaps are contrast-level: each column represents one
+# contrast (not an individual sample). This design choice makes cross-contrast
+# patterns immediately visible and avoids inflating figure count.
+# --------------------------------------------------------------------------
+contrast_table <- tibble::tribble(
+  ~label, ~numerator, ~denominator, ~question,
+  "ROO vs Control", "ROO", "Control", "Effect of ROO diet versus control diet in mouse heart.",
+  "ROO_omega3 vs ROO", "ROO_omega3", "ROO", "Specific effect of omega-3 supplementation on the ROO dietary background.",
+  "ROO_omega3 vs Control", "ROO_omega3", "Control", "Effect of ROO plus omega-3 diet versus control diet in mouse heart."
+)
+
+contrast_order <- contrast_table$label
+contrast_display_names <- c(
+  "ROO vs Control" = "ROO vs Control",
+  "ROO_omega3 vs ROO" = "ROO+w3 vs ROO",
+  "ROO_omega3 vs Control" = "ROO+w3 vs Control"
+)
+
+# Shared up/down/neutral palette for volcano plots, chord plots and heatmap annotations
+up_down_colors <- c(
+  Up = "#B2182B",
+  Down = "#2166AC",
+  Neutral = "grey70"
+)
+
+make_kable(sample_meta, "Mouse heart diet metadata")
+make_kable(contrast_table, "Contrasts - mouse heart diet analysis")
+```
+
+# VERTIENTE 1. RNA-seq QC
+
+## Load count matrix and select heart diet samples
+
+```{r load-counts}
+# --------------------------------------------------------------------------
+# COUNT MATRIX LOADING AND PREPROCESSING
+# The first column is coerced to "gene_id" regardless of its original name.
+# Gene IDs may be either plain Ensembl IDs (ENSMUSG...) or composite strings
+# of the form "ENSMUSG...|GeneSymbol"; both formats are handled.
+# Version suffixes (.N) are stripped from Ensembl IDs before annotation.
+# Counts for duplicate Ensembl IDs (e.g. from multi-mapping) are summed.
+# The final count_matrix is an integer matrix with genes as rows and samples
+# as columns, aligned to the row order of sample_meta.
+# --------------------------------------------------------------------------
+if (!file.exists(COUNT_FILE)) stop("Count file not found: ", COUNT_FILE)
+
+counts_tbl <- readr::read_csv(COUNT_FILE, show_col_types = FALSE)
+
+if (!"gene_id" %in% colnames(counts_tbl) && "Geneid" %in% colnames(counts_tbl)) {
+  counts_tbl <- counts_tbl |> dplyr::rename(gene_id = Geneid)
+}
+if (!"gene_id" %in% colnames(counts_tbl)) {
+  colnames(counts_tbl)[1] <- "gene_id"
+}
+
+missing_samples <- setdiff(selected_samples, colnames(counts_tbl))
+if (length(missing_samples) > 0) {
+  stop("Missing selected samples in count matrix: ", paste(missing_samples, collapse = ", "))
+}
+
+counts_tbl <- counts_tbl |>
+  dplyr::select(gene_id, dplyr::all_of(selected_samples)) |>
+  dplyr::mutate(
+    ensembl_id = stringr::str_replace(gene_id, "\\.[0-9]+$", ""),
+    ensembl_id = stringr::str_replace(ensembl_id, "\\|.*$", ""),
+    input_symbol = dplyr::if_else(
+      stringr::str_detect(gene_id, "\\|"),
+      stringr::str_replace(gene_id, "^.*\\|", ""),
+      NA_character_
+    ),
+    input_symbol = dplyr::na_if(input_symbol, "")
+  )
+
+symbol_map_from_file <- counts_tbl |>
+  dplyr::select(ensembl_id, input_symbol) |>
+  dplyr::filter(!is.na(input_symbol), input_symbol != "") |>
+  dplyr::distinct(ensembl_id, .keep_all = TRUE)
+
+counts_aggregated <- counts_tbl |>
+  dplyr::select(ensembl_id, dplyr::all_of(selected_samples)) |>
+  dplyr::group_by(ensembl_id) |>
+  dplyr::summarise(dplyr::across(dplyr::all_of(selected_samples), ~ sum(as.numeric(.x), na.rm = TRUE)), .groups = "drop")
+
+count_matrix <- counts_aggregated |>
+  dplyr::select(dplyr::all_of(selected_samples)) |>
+  as.matrix()
+rownames(count_matrix) <- counts_aggregated$ensembl_id
+storage.mode(count_matrix) <- "integer"
+
+stopifnot(all(colnames(count_matrix) == rownames(sample_meta)))
+stopifnot(!anyNA(count_matrix), all(count_matrix >= 0))
+
+cat("Mouse heart diet matrix:", nrow(count_matrix), "genes x", ncol(count_matrix), "samples\n")
+cat("Genes with zero counts across selected samples:", sum(rowSums(count_matrix) == 0), "\n")
+make_kable(head(as.data.frame(count_matrix[, seq_len(min(6, ncol(count_matrix)))])), "First rows after sample selection")
+```
+
+## Library size, detected genes and raw count distributions
+
+```{r qc-basic, fig.width=10, fig.height=5}
+qc_metrics <- tibble::tibble(
+  sample = colnames(count_matrix),
+  library_size = colSums(count_matrix),
+  library_size_millions = library_size / 1e6,
+  detected_genes = colSums(count_matrix > 0)
+) |>
+  dplyr::left_join(sample_meta |> dplyr::select(sample, condition_label), by = "sample")
+
+readr::write_csv(qc_metrics, file.path(DIRS$qc, "sample_qc_metrics_mouse_heart_diet.csv"))
+
+p_lib <- ggplot(qc_metrics, aes(sample, library_size_millions, fill = condition_label)) +
+  geom_col(color = "white", linewidth = 0.3) +
+  geom_hline(yintercept = median(qc_metrics$library_size_millions), linetype = "dashed", color = "grey35") +
+  scale_fill_manual(values = cond_colors, name = "Condition") +
+  scale_y_continuous(labels = scales::comma, expand = expansion(mult = c(0, 0.08))) +
+  labs(title = "Library size - mouse heart diet samples", x = NULL, y = "Total counts (millions)") +
+  heart_theme() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_detected <- ggplot(qc_metrics, aes(sample, detected_genes, fill = condition_label)) +
+  geom_col(color = "white", linewidth = 0.3) +
+  scale_fill_manual(values = cond_colors, name = "Condition") +
+  scale_y_continuous(labels = scales::comma, expand = expansion(mult = c(0, 0.08))) +
+  labs(title = "Detected genes - mouse heart diet samples", x = NULL, y = "Genes with count > 0") +
+  heart_theme() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_lib)
+print(p_detected)
+save_plot(p_lib, "QC_library_size_mouse_heart_diet", width = 10, height = 5, dir = DIRS$qc)
+save_plot(p_detected, "QC_detected_genes_mouse_heart_diet", width = 10, height = 5, dir = DIRS$qc)
+
+log_counts <- log2(count_matrix + 1)
+df_box <- as.data.frame(log_counts) |>
+  tibble::rownames_to_column("ensembl_id") |>
+  tidyr::pivot_longer(-ensembl_id, names_to = "sample", values_to = "log2_count") |>
+  dplyr::left_join(sample_meta |> dplyr::select(sample, condition_label), by = "sample")
+
+p_box <- ggplot(df_box, aes(sample, log2_count, fill = condition_label)) +
+  geom_boxplot(outlier.size = 0.2, outlier.alpha = 0.25, linewidth = 0.35) +
+  scale_fill_manual(values = cond_colors, name = "Condition") +
+  labs(title = "Raw count distribution - mouse heart diet samples", x = NULL, y = expression(log[2](count + 1))) +
+  heart_theme() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(p_box)
+save_plot(p_box, "QC_raw_distribution_mouse_heart_diet", width = 10, height = 5, dir = DIRS$qc)
+
+make_kable(qc_metrics, "QC metrics - mouse heart diet samples")
+```
+
+## Filtering, DESeq2 normalisation and PCA
+
+```{r deseq-qc, fig.width=8, fig.height=6}
+# --------------------------------------------------------------------------
+# LOW-EXPRESSION FILTERING AND DESeq2 NORMALISATION
+# Genes with fewer than MIN_COUNT reads in at least MIN_SAMPLES samples are
+# removed before fitting the DESeq2 model. This conservative filter reduces
+# multiple-testing burden without discarding biologically relevant lowly
+# expressed genes.
+#
+# DESeq2 is run with a simple ~ condition_code design. Normalised expression
+# values for QC and visualisation are obtained via variance-stabilising
+# transformation (VST, blind = TRUE), which is appropriate for exploratory
+# analyses because it does not use the design matrix.
+#
+# PCA is computed on both the raw log2(count+1) matrix (before normalisation)
+# and the VST-normalised matrix to show the effect of normalisation on
+# sample clustering.
+# --------------------------------------------------------------------------
+keep_gene <- rowSums(count_matrix >= MIN_COUNT) >= MIN_SAMPLES
+count_matrix_filtered <- count_matrix[keep_gene, , drop = FALSE]
+
+filter_summary <- tibble::tibble(
+  metric = c("Genes before filtering", "Genes retained", "Genes removed"),
+  value = c(nrow(count_matrix), nrow(count_matrix_filtered), nrow(count_matrix) - nrow(count_matrix_filtered))
+)
+readr::write_csv(filter_summary, file.path(DIRS$qc, "filtering_summary_mouse_heart_diet.csv"))
+make_kable(filter_summary, "Filtering summary - mouse heart diet samples")
+
+dds <- DESeq2::DESeqDataSetFromMatrix(
+  countData = count_matrix_filtered,
+  colData = sample_meta,
+  design = ~ condition_code
+)
+dds$condition_code <- stats::relevel(dds$condition_code, ref = "Control")
+dds <- DESeq2::DESeq(dds)
+
+size_factor_table <- tibble::tibble(
+  sample = names(DESeq2::sizeFactors(dds)),
+  size_factor = as.numeric(DESeq2::sizeFactors(dds))
+) |>
+  dplyr::left_join(sample_meta |> dplyr::select(sample, condition_label), by = "sample")
+readr::write_csv(size_factor_table, file.path(DIRS$qc, "size_factors_mouse_heart_diet.csv"))
+
+vst_data <- DESeq2::vst(dds, blind = TRUE)
+vst_mat <- SummarizedExperiment::assay(vst_data)
+
+run_pca <- function(mat, title) {
+  pca <- prcomp(t(mat), center = TRUE, scale. = TRUE)
+  pct <- round(100 * pca$sdev^2 / sum(pca$sdev^2), 1)
+  df <- as.data.frame(pca$x[, 1:2]) |>
+    tibble::rownames_to_column("sample") |>
+    dplyr::left_join(sample_meta |> dplyr::select(sample, condition_label, mouse_id), by = "sample")
+  ggplot(df, aes(PC1, PC2, color = condition_label, label = mouse_id)) +
+    geom_point(size = 3.2) +
+    ggrepel::geom_text_repel(size = 3, max.overlaps = Inf, seed = 42) +
+    scale_color_manual(values = cond_colors, name = "Condition") +
+    labs(
+      title = title,
+      x = paste0("PC1: ", pct[1], "% variance"),
+      y = paste0("PC2: ", pct[2], "% variance")
+    ) +
+    coord_fixed() +
+    heart_theme()
+}
+
+p_pca_raw <- run_pca(log_counts[rownames(count_matrix_filtered), ], "PCA before normalisation - mouse heart diet samples")
+p_pca_vst <- run_pca(vst_mat, "PCA after VST normalisation - mouse heart diet samples")
+print(p_pca_raw)
+print(p_pca_vst)
+save_plot(p_pca_raw, "QC_PCA_raw_mouse_heart_diet", width = 8, height = 6, dir = DIRS$qc)
+save_plot(p_pca_vst, "QC_PCA_VST_mouse_heart_diet", width = 8, height = 6, dir = DIRS$qc)
+```
+
+## Sample distances and outlier metrics
+
+```{r sample-distance, fig.width=8, fig.height=7}
+# --------------------------------------------------------------------------
+# SAMPLE SIMILARITY AND OUTLIER DETECTION
+# Euclidean distances and Pearson correlations are computed on the VST matrix.
+# A sample is flagged as a potential outlier if its median distance to all
+# other samples exceeds 2 SD above the group mean, or if its mean correlation
+# falls more than 2 SD below the mean (distance_z > 2 | correlation_z < -2).
+#
+# The QC heatmap below is a contrast-level summary: instead of plotting a
+# sample × sample matrix, columns represent contrasts and values are the
+# difference between group centroids in VST space
+# (mean VST numerator - mean VST denominator). This makes the QC heatmap
+# directly comparable to the downstream expression heatmaps.
+# --------------------------------------------------------------------------
+sample_dist <- dist(t(vst_mat), method = "euclidean")
+sample_dist_mat <- as.matrix(sample_dist)
+sample_cor <- cor(vst_mat, method = "pearson")
+
+outlier_metrics <- tibble::tibble(
+  sample = colnames(vst_mat),
+  median_distance_to_others = apply(sample_dist_mat, 1, function(x) median(x[x > 0])),
+  mean_correlation_to_others = apply(sample_cor, 1, function(x) mean(x[x < 0.999999]))
+) |>
+  dplyr::mutate(
+    distance_z = as.numeric(scale(median_distance_to_others)),
+    correlation_z = as.numeric(scale(mean_correlation_to_others)),
+    potential_outlier = distance_z > 2 | correlation_z < -2
+  ) |>
+  dplyr::left_join(sample_meta |> dplyr::select(sample, condition_label, mouse_id), by = "sample")
+readr::write_csv(outlier_metrics, file.path(DIRS$qc, "sample_outlier_metrics_mouse_heart_diet.csv"))
+make_kable(outlier_metrics, "Outlier metrics - mouse heart diet samples")
+
+# Instead of sample-by-sample heatmaps, this QC heatmap summarises the same VST data
+# at contrast level. Values are differences between group centroids in VST space:
+# mean(VST numerator) - mean(VST denominator). Therefore, every column is a contrast.
+make_vst_centroid_contrast_matrix <- function(expr_mat, genes_use = rownames(expr_mat)) {
+  genes_use <- intersect(genes_use, rownames(expr_mat))
+  out <- sapply(seq_len(nrow(contrast_table)), function(i) {
+    num <- contrast_table$numerator[i]
+    den <- contrast_table$denominator[i]
+    num_samples <- rownames(sample_meta)[sample_meta$condition_code == num]
+    den_samples <- rownames(sample_meta)[sample_meta$condition_code == den]
+    rowMeans(expr_mat[genes_use, num_samples, drop = FALSE]) -
+      rowMeans(expr_mat[genes_use, den_samples, drop = FALSE])
+  })
+  colnames(out) <- contrast_display_names[contrast_table$label]
+  rownames(out) <- genes_use
+  out
+}
+
+top_var_genes_qc <- names(sort(apply(vst_mat, 1, var), decreasing = TRUE))[seq_len(min(150, nrow(vst_mat)))]
+qc_contrast_mat <- make_vst_centroid_contrast_matrix(vst_mat, top_var_genes_qc)
+qc_contrast_mat_z <- t(scale(t(qc_contrast_mat)))
+qc_contrast_mat_z[is.nan(qc_contrast_mat_z)] <- 0
+
+# Row names are Ensembl IDs at this stage (gene_annotation is built later in
+# Vertiente 2). They are not displayed because show_row_names = FALSE, so no
+# translation to symbols is needed here.
+
+ht_qc <- ComplexHeatmap::Heatmap(
+  qc_contrast_mat_z,
+  name = "Z-score",
+  col = circlize::colorRamp2(c(-2, 0, 2), c("#2166AC", "white", "#B2182B")),
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  show_row_names = FALSE,
+  column_names_rot = 45,
+  column_title = "QC contrast-level VST centroid differences",
+  heatmap_legend_param = list(title = "Scaled\ncentroid\ndifference")
+)
+
+fn_qc_svg <- file.path(DIRS$qc, "QC_heatmap_VST_centroid_differences_by_contrast.svg")
+fn_qc_png <- file.path(DIRS$qc, "QC_heatmap_VST_centroid_differences_by_contrast.png")
+grDevices::svg(fn_qc_svg, width = 7, height = 8)
+ComplexHeatmap::draw(ht_qc)
+grDevices::dev.off()
+png(fn_qc_png, width = 7, height = 8, units = "in", res = 300)
+ComplexHeatmap::draw(ht_qc)
+dev.off()
+ComplexHeatmap::draw(ht_qc)
+```
+
+# VERTIENTE 2. Differential expression
+
+## Mouse annotation and contrast extraction
+
+```{r de-results}
+# --------------------------------------------------------------------------
+# GENE ANNOTATION (org.Mm.eg.db)
+# Ensembl IDs are mapped to gene symbols, full gene names, biotype and
+# Entrez IDs using the org.Mm.eg.db annotation package. When the database
+# returns no symbol (e.g. novel or unannotated transcripts), the script
+# falls back to the symbol embedded in the count matrix gene_id column;
+# if that is also absent, the Ensembl ID itself is used as the display name.
+#
+# CONTRAST EXTRACTION (DESeq2::results)
+# Each contrast is extracted independently with pAdjustMethod = "BH".
+# Genes are classified as Up / Down / NS using the global PADJ_CUTOFF and
+# LFC_CUTOFF thresholds. The direction column (Up/Down/Neutral) uses only
+# the sign of log2FC and is used in chord plots regardless of significance.
+#
+# HELPER MATRICES (build_lfc_matrix / build_padj_matrix)
+# Both functions return a gene × contrast matrix ready to pass to
+# ComplexHeatmap. Log2FC values are capped at ±cap to prevent extreme
+# values from dominating the colour scale. Significance asterisks
+# (* p<0.05, ** p<0.01, *** p<0.001) are overlaid on each heatmap cell
+# by make_sig_labels().
+# --------------------------------------------------------------------------
+annotate_ensembl_mouse <- function(ensembl_ids, symbol_map_from_file = NULL) {
+  available_cols <- AnnotationDbi::columns(org.Mm.eg.db)
+  wanted_cols <- intersect(c("SYMBOL", "GENENAME", "GENETYPE", "ENTREZID"), available_cols)
+
+  annot <- AnnotationDbi::select(
+    org.Mm.eg.db,
+    keys = unique(ensembl_ids),
+    keytype = "ENSEMBL",
+    columns = wanted_cols
+  )
+  annot <- annot[!duplicated(annot$ENSEMBL), , drop = FALSE]
+  annot <- annot |>
+    dplyr::rename(ensembl_id = ENSEMBL)
+
+  if (!"SYMBOL" %in% colnames(annot)) annot$SYMBOL <- NA_character_
+  if (!"GENENAME" %in% colnames(annot)) annot$GENENAME <- NA_character_
+  if (!"GENETYPE" %in% colnames(annot)) annot$GENETYPE <- NA_character_
+  if (!"ENTREZID" %in% colnames(annot)) annot$ENTREZID <- NA_character_
+
+  annot <- annot |>
+    dplyr::rename(
+      symbol_orgdb = SYMBOL,
+      description = GENENAME,
+      gene_biotype = GENETYPE,
+      entrez_id = ENTREZID
+    )
+
+  base <- tibble::tibble(ensembl_id = unique(ensembl_ids))
+  out <- base |>
+    dplyr::left_join(annot, by = "ensembl_id")
+
+  if (!is.null(symbol_map_from_file)) {
+    out <- out |>
+      dplyr::left_join(symbol_map_from_file, by = "ensembl_id")
+  } else {
+    out$input_symbol <- NA_character_
+  }
+
+  out |>
+    dplyr::mutate(
+      symbol = dplyr::coalesce(symbol_orgdb, input_symbol, ensembl_id),
+      symbol = dplyr::if_else(is.na(symbol) | symbol == "", ensembl_id, symbol),
+      symbol_upper = toupper(symbol)
+    ) |>
+    dplyr::select(ensembl_id, symbol, symbol_upper, description, gene_biotype, entrez_id, input_symbol, symbol_orgdb)
+}
+
+gene_annotation <- annotate_ensembl_mouse(rownames(dds), symbol_map_from_file)
+readr::write_csv(gene_annotation, file.path(DIRS$tables, "gene_annotation_mouse_heart_diet.csv"))
+readr::write_csv(contrast_table, file.path(DIRS$de, "contrast_definitions_mouse_heart_diet.csv"))
+
+extract_contrast <- function(numerator, denominator, label) {
+  res <- DESeq2::results(
+    dds,
+    contrast = c("condition_code", numerator, denominator),
+    pAdjustMethod = "BH",
+    alpha = PADJ_CUTOFF
+  )
+
+  as.data.frame(res) |>
+    tibble::rownames_to_column("ensembl_id") |>
+    dplyr::left_join(gene_annotation, by = "ensembl_id") |>
+    dplyr::mutate(
+      symbol = dplyr::if_else(is.na(symbol) | symbol == "", ensembl_id, symbol),
+      contrast = label,
+      status = dplyr::case_when(
+        !is.na(padj) & padj < PADJ_CUTOFF & log2FoldChange >= LFC_CUTOFF ~ "Up",
+        !is.na(padj) & padj < PADJ_CUTOFF & log2FoldChange <= -LFC_CUTOFF ~ "Down",
+        TRUE ~ "NS"
+      ),
+      direction = dplyr::case_when(
+        !is.na(log2FoldChange) & log2FoldChange > 0 ~ "Up",
+        !is.na(log2FoldChange) & log2FoldChange < 0 ~ "Down",
+        TRUE ~ "Neutral"
+      )
+    ) |>
+    dplyr::arrange(padj)
+}
+
+contrast_results <- setNames(vector("list", nrow(contrast_table)), contrast_table$label)
+for (i in seq_len(nrow(contrast_table))) {
+  ct <- contrast_table[i, ]
+  contrast_results[[ct$label]] <- extract_contrast(ct$numerator, ct$denominator, ct$label)
+}
+
+for (nm in names(contrast_results)) {
+  readr::write_csv(
+    contrast_results[[nm]],
+    file.path(DIRS$de, paste0("DESeq2_all_", safe_name(nm), ".csv"))
+  )
+  readr::write_csv(
+    contrast_results[[nm]] |> dplyr::filter(status != "NS"),
+    file.path(DIRS$de, paste0("DESeq2_DEGs_", safe_name(nm), ".csv"))
+  )
+}
+
+deg_summary <- dplyr::bind_rows(lapply(names(contrast_results), function(nm) {
+  tab <- contrast_results[[nm]]
+  tibble::tibble(
+    contrast = nm,
+    upregulated = sum(tab$status == "Up", na.rm = TRUE),
+    downregulated = sum(tab$status == "Down", na.rm = TRUE),
+    total_degs = sum(tab$status != "NS", na.rm = TRUE)
+  )
+}))
+readr::write_csv(deg_summary, file.path(DIRS$de, "DEG_summary_mouse_heart_diet.csv"))
+make_kable(deg_summary, "DEG summary - mouse heart diet analysis")
+
+# Helper matrices for all contrast-level gene heatmaps.
+# Rows = genes; columns = contrasts; values = DESeq2 log2 fold-change.
+build_lfc_matrix <- function(genes_use, row_labels = NULL, cap = 3) {
+  genes_use <- unique(genes_use[!is.na(genes_use)])
+
+  lfc_df <- dplyr::bind_rows(lapply(contrast_order, function(nm) {
+    contrast_results[[nm]] |>
+      dplyr::filter(ensembl_id %in% genes_use) |>
+      dplyr::select(ensembl_id, symbol, contrast, log2FoldChange, padj, status, direction)
+  })) |>
+    dplyr::mutate(
+      contrast = factor(contrast, levels = contrast_order),
+      contrast_label = contrast_display_names[as.character(contrast)]
+    )
+
+  mat <- lfc_df |>
+    dplyr::select(ensembl_id, contrast_label, log2FoldChange) |>
+    tidyr::pivot_wider(names_from = contrast_label, values_from = log2FoldChange) |>
+    tibble::column_to_rownames("ensembl_id") |>
+    as.matrix()
+
+  mat <- mat[intersect(genes_use, rownames(mat)), unname(contrast_display_names[contrast_order]), drop = FALSE]
+  mat[is.infinite(mat)] <- NA_real_
+  mat_plot <- pmax(pmin(mat, cap), -cap)
+
+  if (is.null(row_labels)) {
+    row_labels <- gene_annotation$symbol[match(rownames(mat_plot), gene_annotation$ensembl_id)]
+  }
+  row_labels <- dplyr::if_else(is.na(row_labels) | row_labels == "", rownames(mat_plot), row_labels)
+  rownames(mat_plot) <- make.unique(row_labels)
+  mat_plot
+}
+
+build_padj_matrix <- function(genes_use, row_labels = NULL) {
+  genes_use <- unique(genes_use[!is.na(genes_use)])
+
+  padj_df <- dplyr::bind_rows(lapply(contrast_order, function(nm) {
+    contrast_results[[nm]] |>
+      dplyr::filter(ensembl_id %in% genes_use) |>
+      dplyr::select(ensembl_id, contrast, padj)
+  })) |>
+    dplyr::mutate(
+      contrast = factor(contrast, levels = contrast_order),
+      contrast_label = contrast_display_names[as.character(contrast)]
+    )
+
+  mat <- padj_df |>
+    dplyr::select(ensembl_id, contrast_label, padj) |>
+    tidyr::pivot_wider(names_from = contrast_label, values_from = padj) |>
+    tibble::column_to_rownames("ensembl_id") |>
+    as.matrix()
+
+  mat <- mat[intersect(genes_use, rownames(mat)), unname(contrast_display_names[contrast_order]), drop = FALSE]
+
+  if (is.null(row_labels)) {
+    row_labels <- gene_annotation$symbol[match(rownames(mat), gene_annotation$ensembl_id)]
+  }
+  row_labels <- dplyr::if_else(is.na(row_labels) | row_labels == "", rownames(mat), row_labels)
+  rownames(mat) <- make.unique(row_labels)
+  mat
+}
+
+make_sig_labels <- function(padj_mat) {
+  sig_mat <- matrix("", nrow = nrow(padj_mat), ncol = ncol(padj_mat), dimnames = dimnames(padj_mat))
+  sig_mat[!is.na(padj_mat) & padj_mat < 0.05] <- "*"
+  sig_mat[!is.na(padj_mat) & padj_mat < 0.01] <- "**"
+  sig_mat[!is.na(padj_mat) & padj_mat < 0.001] <- "***"
+  sig_mat
+}
+```
+
+## Volcano and MA plots
+
+```{r volcano-ma, fig.width=8, fig.height=6}
+make_volcano <- function(res_df, title) {
+  plot_df <- res_df |>
+    dplyr::mutate(
+      neg_log10_padj = -log10(padj),
+      status = factor(status, levels = c("Down", "NS", "Up")),
+      label_gene = !stringr::str_detect(symbol, "^ENSMUSG")
+    )
+
+  max_finite <- suppressWarnings(max(plot_df$neg_log10_padj[is.finite(plot_df$neg_log10_padj)], na.rm = TRUE))
+  if (!is.finite(max_finite)) max_finite <- 0
+  plot_df <- plot_df |>
+    dplyr::mutate(neg_log10_padj = ifelse(is.infinite(neg_log10_padj), max_finite + 1, neg_log10_padj))
+
+  labels <- dplyr::bind_rows(
+    plot_df |> dplyr::filter(status == "Up", label_gene) |> dplyr::arrange(padj) |> dplyr::slice_head(n = TOP_LABEL_GENES),
+    plot_df |> dplyr::filter(status == "Down", label_gene) |> dplyr::arrange(padj) |> dplyr::slice_head(n = TOP_LABEL_GENES)
+  )
+
+  pal <- c(Down = "#2166AC", NS = "grey78", Up = "#B2182B")
+  ggplot(plot_df, aes(log2FoldChange, neg_log10_padj)) +
+    geom_point(aes(color = status), size = 1.2, alpha = 0.75, na.rm = TRUE) +
+    geom_vline(xintercept = c(-LFC_CUTOFF, LFC_CUTOFF), linetype = "dashed", color = "grey45") +
+    geom_hline(yintercept = -log10(PADJ_CUTOFF), linetype = "dashed", color = "grey45") +
+    ggrepel::geom_text_repel(
+      data = labels,
+      aes(label = symbol, color = status),
+      size = 2.8,
+      max.overlaps = Inf,
+      seed = 42,
+      fontface = "italic",
+      show.legend = FALSE
+    ) +
+    scale_color_manual(values = pal, name = NULL) +
+    labs(
+      title = title,
+      subtitle = paste0("|log2FC| >= ", LFC_CUTOFF, "; adjusted p < ", PADJ_CUTOFF),
+      x = expression(log[2]~fold~change),
+      y = expression(-log[10]~adjusted~italic(p))
+    ) +
+    heart_theme()
+}
+
+make_ma <- function(res_df, title) {
+  pal <- c(Down = "#2166AC", NS = "grey78", Up = "#B2182B")
+  ggplot(res_df, aes(log10(baseMean + 1), log2FoldChange, color = status)) +
+    geom_point(size = 0.8, alpha = 0.55, na.rm = TRUE) +
+    geom_hline(yintercept = 0, color = "black", linewidth = 0.4) +
+    geom_hline(yintercept = c(-LFC_CUTOFF, LFC_CUTOFF), linetype = "dashed", color = "grey45") +
+    scale_color_manual(values = pal, name = NULL) +
+    labs(
+      title = title,
+      x = expression(log[10]~(mean~normalized~counts + 1)),
+      y = expression(log[2]~fold~change)
+    ) +
+    heart_theme()
+}
+
+for (nm in names(contrast_results)) {
+  p_v <- make_volcano(contrast_results[[nm]], nm)
+  p_m <- make_ma(contrast_results[[nm]], nm)
+  print(p_v)
+  print(p_m)
+  save_plot(p_v, paste0("Volcano_", safe_name(nm)), width = 8, height = 6, dir = DIRS$de)
+  save_plot(p_m, paste0("MA_", safe_name(nm)), width = 8, height = 5, dir = DIRS$de)
+}
+```
+
+## DEG heatmaps
+
+```{r deg-heatmaps, fig.width=10, fig.height=10}
+# Union of the strongest DEGs from each contrast.
+# This is a contrast-level heatmap: columns are ROO vs Control,
+# ROO+w3 vs ROO and ROO+w3 vs Control. Values are log2 fold-change.
+selected_deg_genes <- dplyr::bind_rows(lapply(contrast_order, function(nm) {
+  contrast_results[[nm]] |>
+    dplyr::filter(status != "NS", !is.na(padj)) |>
+    dplyr::arrange(padj, dplyr::desc(abs(log2FoldChange))) |>
+    dplyr::slice_head(n = TOP_HEATMAP_GENES) |>
+    dplyr::mutate(selection_contrast = nm)
+})) |>
+  dplyr::group_by(ensembl_id, symbol) |>
+  dplyr::summarise(
+    best_padj = min(padj, na.rm = TRUE),
+    strongest_abs_lfc = max(abs(log2FoldChange), na.rm = TRUE),
+    main_selection_contrast = selection_contrast[which.min(padj)][1],
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(best_padj, dplyr::desc(strongest_abs_lfc)) |>
+  dplyr::slice_head(n = max(TOP_HEATMAP_GENES, 75))
+
+if (nrow(selected_deg_genes) >= 2) {
+  genes_use <- selected_deg_genes$ensembl_id
+  labels_use <- selected_deg_genes$symbol
+
+  lfc_mat <- build_lfc_matrix(genes_use, row_labels = labels_use, cap = 3)
+  padj_mat <- build_padj_matrix(genes_use, row_labels = labels_use)
+  sig_mat <- make_sig_labels(padj_mat)
+
+  # Rows are clustered by their log2FC pattern across contrasts.
+  # We do not split by samples because this heatmap is intentionally contrast-level.
+  row_split <- NULL
+
+  ht <- ComplexHeatmap::Heatmap(
+    lfc_mat,
+    name = "log2FC",
+    col = circlize::colorRamp2(c(-3, 0, 3), c("#2166AC", "white", "#B2182B")),
+    na_col = "grey92",
+    cluster_rows = TRUE,
+    cluster_columns = FALSE,
+    row_split = row_split,
+    row_names_gp = grid::gpar(fontsize = 7, fontface = "italic"),
+    column_names_rot = 45,
+    column_title = "Top DEGs by contrast - mouse heart diet",
+    rect_gp = grid::gpar(col = "white", lwd = 0.4),
+    cell_fun = function(j, i, x, y, width, height, fill) {
+      if (sig_mat[i, j] != "") {
+        grid::grid.text(sig_mat[i, j], x = x, y = y, gp = grid::gpar(fontsize = 7, fontface = "bold"))
+      }
+    },
+    heatmap_legend_param = list(title = "log2FC")
+  )
+
+  fn_svg <- file.path(DIRS$de, "Heatmap_top_DEGs_by_contrast_mouse_heart_diet.svg")
+  fn_png <- file.path(DIRS$de, "Heatmap_top_DEGs_by_contrast_mouse_heart_diet.png")
+  grDevices::svg(fn_svg, width = 8, height = max(7, 0.18 * nrow(lfc_mat) + 2))
+  ComplexHeatmap::draw(ht)
+  grDevices::dev.off()
+  png(fn_png, width = 8, height = max(7, 0.18 * nrow(lfc_mat) + 2), units = "in", res = 300)
+  ComplexHeatmap::draw(ht)
+  dev.off()
+  ComplexHeatmap::draw(ht)
+
+  readr::write_csv(
+    tibble::rownames_to_column(as.data.frame(lfc_mat), "gene_symbol"),
+    file.path(DIRS$de, "Heatmap_top_DEGs_by_contrast_log2FC_matrix.csv")
+  )
+} else {
+  message("No significant DEGs available for a contrast-level DEG heatmap.")
+}
+```
+
+# VERTIENTE 3. Targeted cardiac biology
+
+## Curated cardiac gene panels
+
+```{r targeted-panels}
+# --------------------------------------------------------------------------
+# CURATED CARDIAC GENE PANELS
+# Ten biological processes relevant to cardiac physiology and cardiometabolic
+# disease are assessed using manually curated gene lists. The panels cover:
+# contractility/calcium handling, hypertrophic stress response, fatty acid
+# oxidation and lipid handling, mitochondrial OXPHOS, glucose/insulin
+# signalling, inflammation/immune infiltration, fibrosis/ECM remodelling,
+# oxidative stress/antioxidant response, ER stress/autophagy/proteostasis,
+# and endothelial/vascular response.
+#
+# Gene symbols are matched case-insensitively against the annotation table;
+# symbols absent from the filtered count matrix are skipped silently.
+# A separate list (interesting_genes) drives the individual boxplots in
+# the next section.
+# --------------------------------------------------------------------------
+heart_gene_sets <- list(
+  Cardiac_contractility_and_calcium = c(
+    "Myh6", "Myh7", "Tnnt2", "Tnni3", "Tpm1", "Actn2", "Mybpc3", "Atp2a2",
+    "Ryr2", "Pln", "Cacna1c", "Casq2", "Slc8a1"
+  ),
+  Hypertrophy_and_stress_response = c(
+    "Nppa", "Nppb", "Myh7", "Acta1", "Ankrd1", "Fhl1", "Xirp2", "Fos", "Jun", "Egr1"
+  ),
+  Fatty_acid_oxidation_and_lipid_handling = c(
+    "Ppara", "Ppard", "Ppargc1a", "Cpt1b", "Acadvl", "Acadm", "Hadha", "Hadh",
+    "Cd36", "Lpl", "Fabp3", "Plin5", "Acox1", "Scd1", "Ldlr", "Hmgcr"
+  ),
+  Mitochondrial_OXPHOS = c(
+    "Ndufa9", "Ndufb8", "Sdha", "Uqcrc2", "Cox4i1", "Cox5a", "Atp5f1a", "Atp5f1b",
+    "Tfam", "Tomm20", "Cycs", "Ppargc1a"
+  ),
+  Glucose_metabolism_and_insulin_signalling = c(
+    "Slc2a1", "Slc2a4", "Hk2", "Pfkfb3", "Pgam1", "Pdk4", "Ldha", "Insr", "Irs1", "Akt1"
+  ),
+  Inflammation_and_immune_cells = c(
+    "Il1b", "Il6", "Tnf", "Ccl2", "Cxcl10", "Nfkb1", "Nfkbia", "Nlrp3", "Ptprc",
+    "Adgre1", "Itgam", "Cd68", "Lgals3", "Ccr2"
+  ),
+  Fibrosis_and_ECM_remodelling = c(
+    "Col1a1", "Col1a2", "Col3a1", "Col6a1", "Fn1", "Tgfb1", "Postn", "Acta2",
+    "Mmp2", "Mmp9", "Timp1", "Timp2", "Lox"
+  ),
+  Oxidative_stress_and_antioxidant_response = c(
+    "Nfe2l2", "Keap1", "Hmox1", "Nqo1", "Sod1", "Sod2", "Cat", "Gpx1", "Gpx4", "Prdx1", "Txnrd1", "Nos2"
+  ),
+  ER_stress_autophagy_and_proteostasis = c(
+    "Ddit3", "Atf4", "Atf6", "Hspa5", "Xbp1", "Eif2ak3", "Map1lc3b", "Sqstm1", "Becn1", "Atg5"
+  ),
+  Endothelial_and_vascular_response = c(
+    "Pecam1", "Vwf", "Kdr", "Flt1", "Klf2", "Nos3", "Vegfa", "Tek", "Cdh5", "Icam1", "Vcam1"
+  )
+)
+
+interesting_genes <- unique(c(
+  "Nppa", "Nppb", "Myh6", "Myh7", "Tnnt2", "Atp2a2", "Ryr2", "Pln",
+  "Ppara", "Ppargc1a", "Cpt1b", "Acadvl", "Cd36", "Lpl", "Fabp3",
+  "Slc2a4", "Pdk4", "Col1a1", "Col3a1", "Tgfb1", "Postn", "Acta2",
+  "Il6", "Tnf", "Il1b", "Ccl2", "Cxcl10", "Cd68", "Lgals3",
+  "Nfe2l2", "Hmox1", "Nqo1", "Sod2", "Gpx4", "Nos2", "Pecam1", "Vwf", "Nos3"
+))
+
+symbol_to_ensembl <- gene_annotation |>
+  dplyr::filter(!is.na(symbol), symbol != "") |>
+  dplyr::select(symbol, symbol_upper, ensembl_id) |>
+  dplyr::distinct(symbol_upper, .keep_all = TRUE)
+
+map_gene_symbols <- function(gene_symbols) {
+  tibble::tibble(target_symbol = gene_symbols, symbol_upper = toupper(gene_symbols)) |>
+    dplyr::left_join(symbol_to_ensembl, by = "symbol_upper") |>
+    dplyr::mutate(present = !is.na(ensembl_id) & ensembl_id %in% rownames(vst_mat))
+}
+
+target_presence <- dplyr::bind_rows(lapply(names(heart_gene_sets), function(set_name) {
+  map_gene_symbols(heart_gene_sets[[set_name]]) |>
+    dplyr::mutate(category = set_name, .before = 1)
+}))
+
+readr::write_csv(target_presence, file.path(DIRS$targeted, "target_gene_presence_mouse_heart_diet.csv"))
+make_kable(target_presence, "Targeted cardiac gene presence")
+```
+
+## Targeted cardiac-process heatmaps
+
+```{r targeted-heatmaps, fig.width=12, fig.height=10}
+make_process_heatmap <- function(process_name, gene_symbols) {
+  mapped <- map_gene_symbols(gene_symbols) |>
+    dplyr::filter(present) |>
+    dplyr::distinct(ensembl_id, .keep_all = TRUE)
+
+  if (nrow(mapped) < 2) {
+    message("Fewer than 2 genes present for process: ", process_name)
+    return(invisible(NULL))
+  }
+
+  genes_use <- mapped$ensembl_id
+  labels_use <- mapped$symbol[match(genes_use, mapped$ensembl_id)]
+  lfc_mat <- build_lfc_matrix(genes_use, row_labels = labels_use, cap = 2.5)
+  padj_mat <- build_padj_matrix(genes_use, row_labels = labels_use)
+  sig_mat <- make_sig_labels(padj_mat)
+
+  ht <- ComplexHeatmap::Heatmap(
+    lfc_mat,
+    name = "log2FC",
+    col = circlize::colorRamp2(c(-2.5, 0, 2.5), c("#2166AC", "white", "#B2182B")),
+    na_col = "grey92",
+    cluster_rows = TRUE,
+    cluster_columns = FALSE,
+    column_names_rot = 45,
+    row_names_gp = grid::gpar(fontsize = 8, fontface = "italic"),
+    column_title = paste0(stringr::str_replace_all(process_name, "_", " "), " - contrast-level log2FC"),
+    rect_gp = grid::gpar(col = "white", lwd = 0.4),
+    cell_fun = function(j, i, x, y, width, height, fill) {
+      if (sig_mat[i, j] != "") {
+        grid::grid.text(sig_mat[i, j], x = x, y = y, gp = grid::gpar(fontsize = 7, fontface = "bold"))
+      }
+    },
+    heatmap_legend_param = list(title = "log2FC")
+  )
+
+  fn_svg <- file.path(DIRS$targeted, paste0("Heatmap_process_by_contrast_", safe_name(process_name), ".svg"))
+  fn_png <- file.path(DIRS$targeted, paste0("Heatmap_process_by_contrast_", safe_name(process_name), ".png"))
+  grDevices::svg(fn_svg, width = 8, height = max(5.5, 0.28 * nrow(lfc_mat) + 2))
+  ComplexHeatmap::draw(ht)
+  grDevices::dev.off()
+  png(fn_png, width = 8, height = max(5.5, 0.28 * nrow(lfc_mat) + 2), units = "in", res = 300)
+  ComplexHeatmap::draw(ht)
+  dev.off()
+  ComplexHeatmap::draw(ht)
+}
+
+for (process_name in names(heart_gene_sets)) {
+  make_process_heatmap(process_name, heart_gene_sets[[process_name]])
+}
+
+all_target_ids <- target_presence |>
+  dplyr::filter(present) |>
+  dplyr::distinct(ensembl_id, .keep_all = TRUE) |>
+  dplyr::pull(ensembl_id)
+
+if (length(all_target_ids) >= 2) {
+  mapped_all <- target_presence |>
+    dplyr::filter(present) |>
+    dplyr::distinct(ensembl_id, .keep_all = TRUE)
+
+  labels_use <- mapped_all$symbol[match(all_target_ids, mapped_all$ensembl_id)]
+  lfc_mat <- build_lfc_matrix(all_target_ids, row_labels = labels_use, cap = 2.5)
+  padj_mat <- build_padj_matrix(all_target_ids, row_labels = labels_use)
+  sig_mat <- make_sig_labels(padj_mat)
+  row_category <- mapped_all$category[match(all_target_ids, mapped_all$ensembl_id)]
+  row_category <- row_category[seq_len(nrow(lfc_mat))]
+
+  ht <- ComplexHeatmap::Heatmap(
+    lfc_mat,
+    name = "log2FC",
+    col = circlize::colorRamp2(c(-2.5, 0, 2.5), c("#2166AC", "white", "#B2182B")),
+    na_col = "grey92",
+    row_split = row_category,
+    cluster_rows = TRUE,
+    cluster_columns = FALSE,
+    column_names_rot = 45,
+    row_names_gp = grid::gpar(fontsize = 7, fontface = "italic"),
+    column_title = "Mouse heart targeted biological panels - contrast-level log2FC",
+    rect_gp = grid::gpar(col = "white", lwd = 0.4),
+    cell_fun = function(j, i, x, y, width, height, fill) {
+      if (sig_mat[i, j] != "") {
+        grid::grid.text(sig_mat[i, j], x = x, y = y, gp = grid::gpar(fontsize = 7, fontface = "bold"))
+      }
+    },
+    heatmap_legend_param = list(title = "log2FC")
+  )
+
+  fn_svg <- file.path(DIRS$targeted, "Heatmap_all_targeted_cardiac_panels_by_contrast_mouse_heart_diet.svg")
+  fn_png <- file.path(DIRS$targeted, "Heatmap_all_targeted_cardiac_panels_by_contrast_mouse_heart_diet.png")
+  grDevices::svg(fn_svg, width = 9, height = 16)
+  ComplexHeatmap::draw(ht)
+  grDevices::dev.off()
+  png(fn_png, width = 9, height = 16, units = "in", res = 300)
+  ComplexHeatmap::draw(ht)
+  dev.off()
+  ComplexHeatmap::draw(ht)
+
+  readr::write_csv(
+    tibble::rownames_to_column(as.data.frame(lfc_mat), "gene_symbol"),
+    file.path(DIRS$targeted, "targeted_cardiac_panels_by_contrast_log2FC_matrix.csv")
+  )
+}
+
+target_deg_table <- dplyr::bind_rows(lapply(names(contrast_results), function(nm) {
+  contrast_results[[nm]] |>
+    dplyr::filter(symbol_upper %in% unique(toupper(unlist(heart_gene_sets)))) |>
+    dplyr::select(contrast, symbol, ensembl_id, log2FoldChange, stat, pvalue, padj, status, direction)
+}))
+readr::write_csv(target_deg_table, file.path(DIRS$targeted, "targeted_gene_DE_results_mouse_heart_diet.csv"))
+```
+
+## Boxplots for interesting cardiac genes
+
+```{r gene-boxplots, fig.width=12, fig.height=8}
+# --------------------------------------------------------------------------
+# INDIVIDUAL GENE EXPRESSION BOXPLOTS
+# VST-normalised expression is plotted for each gene in interesting_genes.
+# Each dot represents one mouse (labelled with its ID); boxes show the
+# interquartile range. Plots are saved individually and combined into
+# paginated panels of 12 genes (4 columns × 3 rows) for the report.
+# --------------------------------------------------------------------------
+norm_counts <- DESeq2::counts(dds, normalized = TRUE)
+
+make_gene_expression_table <- function(gene_symbols) {
+  mapped <- map_gene_symbols(gene_symbols) |>
+    dplyr::filter(present)
+
+  if (nrow(mapped) == 0) return(tibble::tibble())
+
+  dplyr::bind_rows(lapply(seq_len(nrow(mapped)), function(i) {
+    gene_id <- mapped$ensembl_id[i]
+    gene_symbol <- mapped$symbol[i]
+    tibble::tibble(
+      sample = colnames(vst_mat),
+      ensembl_id = gene_id,
+      symbol = gene_symbol,
+      vst_expression = as.numeric(vst_mat[gene_id, ]),
+      normalized_count = as.numeric(norm_counts[gene_id, ])
+    ) |>
+      dplyr::left_join(sample_meta |> dplyr::select(sample, condition_label, mouse_id), by = "sample")
+  }))
+}
+
+gene_expression_long <- make_gene_expression_table(interesting_genes)
+readr::write_csv(gene_expression_long, file.path(DIRS$boxplots, "interesting_gene_expression_mouse_heart_diet.csv"))
+
+make_single_gene_boxplot <- function(df_gene) {
+  gene_symbol <- unique(df_gene$symbol)[1]
+  ggplot(df_gene, aes(condition_label, vst_expression, fill = condition_label)) +
+    geom_boxplot(width = 0.62, outlier.shape = NA, alpha = 0.75, linewidth = 0.35) +
+    geom_jitter(aes(label = mouse_id), width = 0.12, size = 2.4, alpha = 0.9) +
+    ggrepel::geom_text_repel(aes(label = mouse_id), size = 2.6, max.overlaps = Inf, seed = 42, show.legend = FALSE) +
+    scale_fill_manual(values = cond_colors, guide = "none") +
+    labs(title = gene_symbol, x = NULL, y = "VST expression") +
+    heart_theme(base_size = 10) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1), plot.title = element_text(face = "italic"))
+}
+
+if (nrow(gene_expression_long) > 0) {
+  gene_expression_split <- split(gene_expression_long, gene_expression_long$symbol)
+  gene_boxplots <- lapply(gene_expression_split, make_single_gene_boxplot)
+
+  for (gene_symbol in names(gene_boxplots)) {
+    save_plot(gene_boxplots[[gene_symbol]], paste0("Boxplot_", safe_name(gene_symbol)), width = 4.2, height = 4.2, dir = DIRS$boxplots)
+  }
+
+  genes_per_page <- 12
+  gene_names <- names(gene_boxplots)
+  page_index <- split(gene_names, ceiling(seq_along(gene_names) / genes_per_page))
+  for (i in seq_along(page_index)) {
+    combined <- patchwork::wrap_plots(gene_boxplots[page_index[[i]]], ncol = 4)
+    print(combined)
+    save_plot(combined, paste0("Boxplots_interesting_genes_page_", i), width = 14, height = 10, dir = DIRS$boxplots)
+  }
+}
+```
+
+# VERTIENTE 4. Functional enrichment
+
+## MSigDB gene sets and FGSEA
+
+```{r fgsea, fig.width=9, fig.height=7}
+# --------------------------------------------------------------------------
+# FUNCTIONAL ENRICHMENT: FGSEA
+# Gene set enrichment analysis is performed with fgsea on three MSigDB
+# collections for each of the three contrasts (9 runs total):
+#   - Hallmark (H): 50 curated hallmark gene sets
+#   - GO Biological Process (C5 / GO:BP)
+#   - KEGG pathways (C2 / CP:KEGG)
+#
+# The ranking metric is the DESeq2 Wald statistic (stat), which encodes
+# both direction and magnitude of differential expression. When a gene
+# symbol maps to multiple Ensembl IDs, only the entry with the highest
+# |stat| is used (slice_max).
+#
+# fgsea parameters: minSize = 15, maxSize = 500 (standard for bulk RNA-seq).
+# Results from all collections and contrasts are concatenated into fgsea_all
+# and written to disk both as a single combined CSV and as per-contrast /
+# per-collection CSVs.
+#
+# load_msigdb() handles API differences between msigdbr >= 7.5 (which uses
+# collection/subcollection) and older versions (category/subcategory).
+# --------------------------------------------------------------------------
+load_msigdb <- function(collection, subcollection = NULL) {
+  fml <- names(formals(msigdbr::msigdbr))
+  out <- tryCatch({
+    if ("collection" %in% fml) {
+      if (!is.null(subcollection) && "subcollection" %in% fml) {
+        msigdbr::msigdbr(species = "Mus musculus", collection = collection, subcollection = subcollection)
+      } else {
+        msigdbr::msigdbr(species = "Mus musculus", collection = collection)
+      }
+    } else {
+      if (!is.null(subcollection)) {
+        msigdbr::msigdbr(species = "Mus musculus", category = collection, subcategory = subcollection)
+      } else {
+        msigdbr::msigdbr(species = "Mus musculus", category = collection)
+      }
+    }
+  }, error = function(e) {
+    message("Could not load MSigDB collection ", collection, " / ", subcollection, ": ", conditionMessage(e))
+    tibble::tibble()
+  })
+  out
+}
+
+prepare_pathways <- function(msig_tbl) {
+  if (nrow(msig_tbl) == 0) return(list())
+  msig_tbl_clean <- msig_tbl |>
+    dplyr::filter(!is.na(gs_name), !is.na(gene_symbol)) |>
+    dplyr::select(gs_name, gene_symbol) |>
+    dplyr::distinct()
+  split(msig_tbl_clean, msig_tbl_clean$gs_name) |>
+    lapply(function(x) unique(x$gene_symbol))
+}
+
+msig_hallmark <- load_msigdb("H")
+msig_go_bp <- load_msigdb("C5", "GO:BP")
+msig_kegg <- load_msigdb("C2", "CP:KEGG")
+
+pathway_collections <- list(
+  Hallmark = prepare_pathways(msig_hallmark),
+  GO_BP = prepare_pathways(msig_go_bp),
+  KEGG = prepare_pathways(msig_kegg)
+)
+pathway_collections <- pathway_collections[lengths(pathway_collections) > 0]
+
+prepare_ranked_stats <- function(res_df) {
+  ranked <- res_df |>
+    dplyr::filter(!is.na(symbol), !is.na(stat), !stringr::str_detect(symbol, "^ENSMUSG")) |>
+    dplyr::group_by(symbol) |>
+    dplyr::slice_max(order_by = abs(stat), n = 1, with_ties = FALSE) |>
+    dplyr::ungroup() |>
+    dplyr::arrange(dplyr::desc(stat))
+
+  ranks <- ranked$stat
+  names(ranks) <- ranked$symbol
+  sort(ranks, decreasing = TRUE)
+}
+
+run_fgsea_one <- function(res_df, contrast_name, collection_name, pathways) {
+  ranks <- prepare_ranked_stats(res_df)
+  if (length(ranks) < 100 || length(pathways) == 0) return(tibble::tibble())
+
+  fg <- fgsea::fgsea(
+    pathways = pathways,
+    stats = ranks,
+    minSize = 15,
+    maxSize = 500
+  ) |>
+    as_tibble() |>
+    dplyr::arrange(padj, dplyr::desc(abs(NES))) |>
+    dplyr::mutate(
+      contrast = contrast_name,
+      collection = collection_name,
+      pathway_clean = clean_pathway_name(pathway)
+    ) |>
+    dplyr::relocate(contrast, collection)
+
+  fg
+}
+
+fgsea_results <- list()
+for (contrast_name in names(contrast_results)) {
+  for (collection_name in names(pathway_collections)) {
+    key <- paste(contrast_name, collection_name, sep = "__")
+    fgsea_results[[key]] <- run_fgsea_one(
+      contrast_results[[contrast_name]],
+      contrast_name,
+      collection_name,
+      pathway_collections[[collection_name]]
+    )
+  }
+}
+
+fgsea_all <- dplyr::bind_rows(fgsea_results)
+
+fgsea_all_csv <- fgsea_all |>
+  dplyr::mutate(leadingEdge = vapply(leadingEdge, paste, collapse = ";", FUN.VALUE = character(1)))
+readr::write_csv(fgsea_all_csv, file.path(DIRS$enrichment, "FGSEA_all_results_mouse_heart_diet.csv"))
+
+for (contrast_name in unique(fgsea_all_csv$contrast)) {
+  for (collection_name in unique(fgsea_all_csv$collection)) {
+    tab <- fgsea_all_csv |>
+      dplyr::filter(contrast == contrast_name, collection == collection_name)
+    if (nrow(tab) > 0) {
+      readr::write_csv(
+        tab,
+        file.path(DIRS$enrichment, paste0("FGSEA_", safe_name(collection_name), "_", safe_name(contrast_name), ".csv"))
+      )
+    }
+  }
+}
+
+make_kable(
+  fgsea_all_csv |>
+    dplyr::filter(padj < PADJ_CUTOFF) |>
+    dplyr::select(contrast, collection, pathway_clean, NES, pval, padj, size) |>
+    dplyr::arrange(padj) |>
+    dplyr::slice_head(n = 30),
+  "Top significant FGSEA terms across contrasts"
+)
+```
+
+## Enrichment dotplots
+
+```{r enrichment-dotplots, fig.width=9, fig.height=7}
+make_fgsea_dotplot <- function(fgsea_df, contrast_name, collection_name) {
+  tab <- fgsea_df |>
+    dplyr::filter(contrast == contrast_name, collection == collection_name, !is.na(padj), !is.na(NES))
+
+  if (nrow(tab) == 0) return(invisible(NULL))
+
+  plot_df <- dplyr::bind_rows(
+    tab |> dplyr::filter(NES > 0) |> dplyr::arrange(padj) |> dplyr::slice_head(n = TOP_ENRICHMENT_TERMS / 2),
+    tab |> dplyr::filter(NES < 0) |> dplyr::arrange(padj) |> dplyr::slice_head(n = TOP_ENRICHMENT_TERMS / 2)
+  ) |>
+    dplyr::distinct(pathway, .keep_all = TRUE) |>
+    dplyr::mutate(
+      pathway_clean = stringr::str_trunc(pathway_clean, 65),
+      significant = padj < PADJ_CUTOFF
+    )
+
+  if (nrow(plot_df) == 0) return(invisible(NULL))
+
+  p <- ggplot(plot_df, aes(NES, forcats::fct_reorder(pathway_clean, NES))) +
+    geom_vline(xintercept = 0, linewidth = 0.35, color = "grey40") +
+    geom_point(aes(size = -log10(padj), color = significant), alpha = 0.85) +
+    scale_color_manual(values = c(`TRUE` = "#B2182B", `FALSE` = "grey55"), name = paste0("FDR < ", PADJ_CUTOFF)) +
+    scale_size_continuous(name = expression(-log[10]~adjusted~italic(p))) +
+    labs(
+      title = paste(collection_name, "FGSEA -", contrast_name),
+      x = "Normalized enrichment score (NES)",
+      y = NULL
+    ) +
+    heart_theme()
+
+  print(p)
+  save_plot(p, paste0("FGSEA_dotplot_", safe_name(collection_name), "_", safe_name(contrast_name)), width = 9, height = 7, dir = DIRS$enrichment)
+}
+
+for (contrast_name in unique(fgsea_all$contrast)) {
+  for (collection_name in unique(fgsea_all$collection)) {
+    make_fgsea_dotplot(fgsea_all, contrast_name, collection_name)
+  }
+}
+```
+
+## GSEA enrichment plots
+
+```{r gsea-enrichment-plots, fig.width=8, fig.height=4}
+# --------------------------------------------------------------------------
+# GSEA ENRICHMENT PLOTS (contrast-level)
+# For each contrast × collection combination, the top N_GSEA_PLOTS pathways
+# are visualised using fgsea::plotEnrichment(). The function generates the
+# classic three-panel enrichment plot:
+#   - Top panel:    running enrichment score curve (green line).
+#   - Middle panel: rug plot marking where each gene set member falls in the
+#                   ranked list (dense = early hits, sparse = late hits).
+#   - Bottom panel: ranked list metric (DESeq2 Wald statistic) across all
+#                   genes, from most upregulated (left) to most
+#                   downregulated (right).
+#
+# Terms are selected separately for the positive and negative NES tails so
+# that both directions are represented. The subtitle of each plot shows the
+# contrast, collection, NES and FDR for traceability.
+# Each plot is saved as SVG + PNG in DIRS$enrichment with the naming pattern:
+#   GSEA_enrichplot_<collection>_<contrast>_<pathway>.svg/.png
+# --------------------------------------------------------------------------
+N_GSEA_PLOTS <- 3  # number of top terms per direction (up + down) per contrast
+
+make_gsea_enrichment_plots <- function(fgsea_df, contrast_name, collection_name,
+                                       pathways, n_top = N_GSEA_PLOTS) {
+  tab <- fgsea_df |>
+    dplyr::filter(
+      contrast == contrast_name,
+      collection == collection_name,
+      !is.na(padj),
+      padj < PADJ_CUTOFF,
+      !is.na(NES)
+    ) |>
+    dplyr::arrange(padj, dplyr::desc(abs(NES)))
+
+  top_terms <- dplyr::bind_rows(
+    tab |> dplyr::filter(NES > 0) |> dplyr::slice_head(n = n_top),
+    tab |> dplyr::filter(NES < 0) |> dplyr::slice_head(n = n_top)
+  )
+
+  if (nrow(top_terms) == 0) {
+    message("No significant terms for GSEA enrichment plots: ", contrast_name, " - ", collection_name)
+    return(invisible(NULL))
+  }
+
+  # Ranked stats vector (DESeq2 Wald statistic) for this contrast
+  ranks <- prepare_ranked_stats(contrast_results[[contrast_name]])
+
+  for (i in seq_len(nrow(top_terms))) {
+    term      <- top_terms$pathway[i]
+    term_clean <- top_terms$pathway_clean[i]
+
+    if (!term %in% names(pathways)) next
+
+    p <- fgsea::plotEnrichment(pathways[[term]], ranks) +
+      ggplot2::labs(
+        title    = stringr::str_trunc(term_clean, 70),
+        subtitle = paste0(
+          contrast_display_names[contrast_name], "  |  ", collection_name,
+          "  |  NES = ", round(top_terms$NES[i], 2),
+          "  |  FDR = ", formatC(top_terms$padj[i], format = "e", digits = 2)
+        ),
+        x = "Rank in ordered dataset",
+        y = "Enrichment score"
+      ) +
+      heart_theme(base_size = 11)
+
+    print(p)
+
+    fn <- paste0(
+      "GSEA_enrichplot_",
+      safe_name(collection_name), "_",
+      safe_name(contrast_name), "_",
+      safe_name(term_clean)
+    )
+    save_plot(p, fn, width = 8, height = 4, dir = DIRS$enrichment)
+  }
+}
+
+for (contrast_name in contrast_order) {
+  for (collection_name in names(pathway_collections)) {
+    make_gsea_enrichment_plots(fgsea_all, contrast_name, collection_name,
+                               pathway_collections[[collection_name]])
+  }
+}
+```
+
+## Enrichment NES heatmaps
+
+```{r enrichment-heatmaps, fig.width=10, fig.height=12}
+make_nes_heatmap <- function(fgsea_df, filename, title, filter_regex = NULL, max_terms = TOP_ENRICHMENT_HEATMAP_TERMS) {
+  tab <- fgsea_df |>
+    dplyr::filter(
+      contrast %in% contrast_order,
+      !is.na(NES),
+      !is.na(padj)
+    ) |>
+    dplyr::mutate(
+      contrast = factor(contrast, levels = contrast_order),
+      contrast_label = contrast_display_names[as.character(contrast)]
+    )
+
+  if (!is.null(filter_regex)) {
+    tab <- tab |>
+      dplyr::filter(stringr::str_detect(tolower(pathway_clean), stringr::regex(filter_regex, ignore_case = TRUE)))
+  }
+
+  if (nrow(tab) == 0) return(invisible(NULL))
+
+  selected_terms <- tab |>
+    dplyr::group_by(collection, pathway, pathway_clean) |>
+    dplyr::summarise(
+      min_padj = min(padj, na.rm = TRUE),
+      max_abs_nes = max(abs(NES), na.rm = TRUE),
+      significant_any = any(padj < PADJ_CUTOFF, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    dplyr::arrange(dplyr::desc(significant_any), min_padj, dplyr::desc(max_abs_nes)) |>
+    dplyr::slice_head(n = max_terms)
+
+  heat_df <- tab |>
+    dplyr::semi_join(selected_terms, by = c("collection", "pathway", "pathway_clean")) |>
+    dplyr::mutate(term = paste(collection, stringr::str_trunc(pathway_clean, 70), sep = " | ")) |>
+    dplyr::select(term, contrast_label, NES, padj) |>
+    dplyr::group_by(term, contrast_label) |>
+    dplyr::summarise(NES = NES[which.min(padj)], padj = min(padj, na.rm = TRUE), .groups = "drop")
+
+  if (nrow(heat_df) < 2) return(invisible(NULL))
+
+  nes_mat <- heat_df |>
+    dplyr::select(term, contrast_label, NES) |>
+    tidyr::pivot_wider(names_from = contrast_label, values_from = NES) |>
+    tibble::column_to_rownames("term") |>
+    as.matrix()
+
+  nes_mat <- nes_mat[, unname(contrast_display_names[contrast_order]), drop = FALSE]
+  nes_mat[is.infinite(nes_mat)] <- NA_real_
+  nes_mat_plot <- pmax(pmin(nes_mat, 3), -3)
+
+  padj_mat <- heat_df |>
+    dplyr::select(term, contrast_label, padj) |>
+    tidyr::pivot_wider(names_from = contrast_label, values_from = padj) |>
+    tibble::column_to_rownames("term") |>
+    as.matrix()
+  padj_mat <- padj_mat[rownames(nes_mat_plot), colnames(nes_mat_plot), drop = FALSE]
+  sig_mat <- make_sig_labels(padj_mat)
+
+  ht <- ComplexHeatmap::Heatmap(
+    nes_mat_plot,
+    name = "NES",
+    col = circlize::colorRamp2(c(-3, 0, 3), c("#2166AC", "white", "#B2182B")),
+    na_col = "grey92",
+    cluster_rows = TRUE,
+    cluster_columns = FALSE,
+    row_names_gp = grid::gpar(fontsize = 7),
+    column_names_rot = 45,
+    column_title = title,
+    rect_gp = grid::gpar(col = "white", lwd = 0.4),
+    cell_fun = function(j, i, x, y, width, height, fill) {
+      if (sig_mat[i, j] != "") {
+        grid::grid.text(sig_mat[i, j], x = x, y = y, gp = grid::gpar(fontsize = 7, fontface = "bold"))
+      }
+    },
+    heatmap_legend_param = list(title = "NES")
+  )
+
+  fn_svg <- file.path(DIRS$enrichment, paste0(filename, ".svg"))
+  fn_png <- file.path(DIRS$enrichment, paste0(filename, ".png"))
+  grDevices::svg(fn_svg, width = 9, height = max(6, 0.24 * nrow(nes_mat_plot) + 2))
+  ComplexHeatmap::draw(ht)
+  grDevices::dev.off()
+  png(fn_png, width = 9, height = max(6, 0.24 * nrow(nes_mat_plot) + 2), units = "in", res = 300)
+  ComplexHeatmap::draw(ht)
+  dev.off()
+  ComplexHeatmap::draw(ht)
+
+  readr::write_csv(
+    tibble::rownames_to_column(as.data.frame(nes_mat), "pathway"),
+    file.path(DIRS$enrichment, paste0(filename, "_NES_matrix.csv"))
+  )
+}
+
+make_nes_heatmap(
+  fgsea_all,
+  filename = "FGSEA_NES_heatmap_top_terms_by_contrast_mouse_heart_diet",
+  title = "Top enriched pathways - contrast-level NES"
+)
+
+heart_relevant_regex <- paste(
+  c(
+    "heart", "cardiac", "myocard", "muscle", "contract", "calcium",
+    "mitochond", "oxidative phosphorylation", "respiratory chain",
+    "fatty acid", "lipid", "cholesterol", "peroxisome",
+    "inflamm", "immune", "cytokine", "macrophage", "leukocyte",
+    "fibro", "extracellular matrix", "collagen", "angiogenesis", "vascular", "endothelial",
+    "oxidative stress", "reactive oxygen"
+  ),
+  collapse = "|"
+)
+
+make_nes_heatmap(
+  fgsea_all,
+  filename = "FGSEA_NES_heatmap_heart_relevant_processes_by_contrast_mouse_heart_diet",
+  title = "Heart-relevant enriched processes - contrast-level NES",
+  filter_regex = heart_relevant_regex,
+  max_terms = 60
+)
+```
+
+## Chord plots: enriched pathways and leading-edge genes
+
+```{r chord-plots, fig.width=10, fig.height=10}
+# --------------------------------------------------------------------------
+# CHORD PLOTS: PATHWAYS AND LEADING-EDGE GENES
+# Each chord plot links enriched pathways (left sectors) to their leading-edge
+# genes (right sectors) for one contrast × collection combination.
+# Colour convention: red = upregulated in the numerator of the contrast;
+#                    blue = downregulated.
+# Gene direction is taken from the DESeq2 log2FC of the same contrast.
+# Pathway direction is taken from the sign of the FGSEA NES.
+# A gene that appears in both up- and downregulated pathways is coloured grey.
+# Up to max_terms pathways and max_genes_per_term leading-edge genes are shown
+# to keep the plot readable. Chord plots are generated for Hallmark and GO_BP.
+# --------------------------------------------------------------------------
+make_chord_plot <- function(fgsea_df, contrast_name, collection_name, max_terms = 6, max_genes_per_term = 8) {
+  tab <- fgsea_df |>
+    dplyr::filter(
+      contrast == contrast_name,
+      collection == collection_name,
+      !is.na(padj),
+      padj < PADJ_CUTOFF,
+      !is.na(NES)
+    ) |>
+    dplyr::arrange(padj, dplyr::desc(abs(NES))) |>
+    dplyr::slice_head(n = max_terms)
+
+  if (nrow(tab) == 0) {
+    message("No significant terms for chord plot: ", contrast_name, " - ", collection_name)
+    return(invisible(NULL))
+  }
+
+  # Gene direction is taken from the DESeq2 log2FC of the same contrast.
+  # Red = upregulated in the numerator of the contrast; blue = downregulated.
+  direction_tbl <- contrast_results[[contrast_name]] |>
+    dplyr::filter(!is.na(symbol), !is.na(log2FoldChange)) |>
+    dplyr::group_by(symbol) |>
+    dplyr::slice_max(order_by = abs(stat), n = 1, with_ties = FALSE) |>
+    dplyr::ungroup() |>
+    dplyr::transmute(
+      gene = symbol,
+      log2FoldChange,
+      direction = dplyr::case_when(
+        log2FoldChange > 0 ~ "Up",
+        log2FoldChange < 0 ~ "Down",
+        TRUE ~ "Neutral"
+      )
+    )
+
+  chord_df <- dplyr::bind_rows(lapply(seq_len(nrow(tab)), function(i) {
+    genes <- tab$leadingEdge[[i]]
+    genes <- genes[!is.na(genes)]
+    genes <- head(genes, max_genes_per_term)
+    if (length(genes) == 0) return(tibble::tibble())
+    tibble::tibble(
+      pathway = stringr::str_trunc(tab$pathway_clean[i], 36),
+      gene = genes,
+      NES = tab$NES[i],
+      pathway_direction = dplyr::case_when(
+        tab$NES[i] > 0 ~ "Up",
+        tab$NES[i] < 0 ~ "Down",
+        TRUE ~ "Neutral"
+      ),
+      value = 1
+    )
+  })) |>
+    dplyr::left_join(direction_tbl, by = "gene") |>
+    dplyr::mutate(
+      direction = dplyr::coalesce(direction, pathway_direction, "Neutral"),
+      link_color = dplyr::case_when(
+        direction == "Up" ~ up_down_colors["Up"],
+        direction == "Down" ~ up_down_colors["Down"],
+        TRUE ~ up_down_colors["Neutral"]
+      )
+    )
+
+  if (nrow(chord_df) == 0) return(invisible(NULL))
+
+  chord_links <- chord_df |>
+    dplyr::select(pathway, gene, value)
+
+  pathway_colors <- chord_df |>
+    dplyr::distinct(pathway, pathway_direction) |>
+    dplyr::mutate(color = dplyr::case_when(
+      pathway_direction == "Up" ~ up_down_colors["Up"],
+      pathway_direction == "Down" ~ up_down_colors["Down"],
+      TRUE ~ "grey75"
+    ))
+
+  gene_colors <- chord_df |>
+    dplyr::group_by(gene) |>
+    dplyr::summarise(
+      direction = dplyr::case_when(
+        any(direction == "Up") & !any(direction == "Down") ~ "Up",
+        any(direction == "Down") & !any(direction == "Up") ~ "Down",
+        any(direction == "Up") & any(direction == "Down") ~ "Neutral",
+        TRUE ~ "Neutral"
+      ),
+      .groups = "drop"
+    ) |>
+    dplyr::mutate(color = dplyr::case_when(
+      direction == "Up" ~ up_down_colors["Up"],
+      direction == "Down" ~ up_down_colors["Down"],
+      TRUE ~ up_down_colors["Neutral"]
+    ))
+
+  grid_col <- c(
+    stats::setNames(pathway_colors$color, pathway_colors$pathway),
+    stats::setNames(gene_colors$color, gene_colors$gene)
+  )
+  link_col <- chord_df$link_color
+
+  plot_chord_once <- function() {
+    circlize::circos.clear()
+    circlize::chordDiagram(
+      chord_links,
+      col = link_col,
+      grid.col = grid_col,
+      transparency = 0.20,
+      annotationTrack = "grid",
+      preAllocateTracks = 1
+    )
+    circlize::circos.trackPlotRegion(
+      track.index = 1,
+      panel.fun = function(x, y) {
+        sector.name <- circlize::get.cell.meta.data("sector.index")
+        xlim <- circlize::get.cell.meta.data("xlim")
+        ylim <- circlize::get.cell.meta.data("ylim")
+        circlize::circos.text(
+          mean(xlim), ylim[1] + 0.1, sector.name,
+          facing = "clockwise", niceFacing = TRUE,
+          adj = c(0, 0.5), cex = 0.45
+        )
+      },
+      bg.border = NA
+    )
+    title(paste(collection_name, "-", contrast_display_names[contrast_name], "\nred = upregulated; blue = downregulated"))
+    legend(
+      "bottomleft",
+      legend = c("Upregulated", "Downregulated"),
+      fill = c(up_down_colors["Up"], up_down_colors["Down"]),
+      border = NA,
+      bty = "n",
+      cex = 0.8
+    )
+    circlize::circos.clear()
+  }
+
+  fn_svg <- file.path(DIRS$enrichment, paste0("Chord_up_down_", safe_name(collection_name), "_", safe_name(contrast_name), ".svg"))
+  fn_png <- file.path(DIRS$enrichment, paste0("Chord_up_down_", safe_name(collection_name), "_", safe_name(contrast_name), ".png"))
+
+  grDevices::svg(fn_svg, width = 10, height = 10)
+  plot_chord_once()
+  grDevices::dev.off()
+
+  png(fn_png, width = 10, height = 10, units = "in", res = 300)
+  plot_chord_once()
+  dev.off()
+
+  plot_chord_once()
+
+  readr::write_csv(
+    chord_df |>
+      dplyr::select(pathway, gene, NES, pathway_direction, log2FoldChange, direction),
+    file.path(DIRS$enrichment, paste0("Chord_table_up_down_", safe_name(collection_name), "_", safe_name(contrast_name), ".csv"))
+  )
+}
+
+for (contrast_name in contrast_order) {
+  for (collection_name in intersect(c("Hallmark", "GO_BP"), unique(fgsea_all$collection))) {
+    make_chord_plot(fgsea_all, contrast_name, collection_name)
+  }
+}
+```
+
+# Output and reproducibility
+
+```{r output-summary}
+generated_files <- list.files(OUT_DIR, recursive = TRUE, full.names = TRUE)
+cat("Generated files:", length(generated_files), "\n")
+data.frame(file = generated_files) |> make_kable("Generated mouse heart diet output files")
+```
+
+```{r session-info}
+sessionInfo()
+```
